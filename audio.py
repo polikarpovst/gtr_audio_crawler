@@ -1,5 +1,4 @@
 from __future__ import print_function
-import mysql.connector
 import pyaudio
 import wave
 import struct
@@ -9,10 +8,10 @@ import time
 import os
 import random
 import configparser
-import mysql.connector
+import requests
 from datetime import datetime
-from mysql.connector import errorcode
 from wave import Wave_write
+from urllib.error import HTTPError
 
 def load_configfile() :
     #
@@ -47,20 +46,19 @@ def get_config_audio(config) :
         print("    GET AUDIO PART OF CONFIG ERROR")
         return None
 
-def get_config_controldb(config) :
+def get_config_integration(config) :
     #
-    # Формирование конфигурации подключения к управляющей БД
-    # на основе указанных в файле настроек
+    # Формирование конфигурации передачи данных и получения статуса
     #
     try:
-        db_config = {}
-        db_config['User'] = config['CONTROLMYSQL'].get('User')
-        db_config['Password'] = config['CONTROLMYSQL'].get('Password')
-        db_config['Host'] = config['CONTROLMYSQL'].get('Host')
-        db_config['Database'] = config['CONTROLMYSQL'].get('Database')
-        return db_config
+        integration_config = {}
+        integration_config['Token'] = config['INTEGRATION'].get('Token')
+        integration_config['SourceName'] = config['INTEGRATION'].get('SourceName')
+        integration_config['Host'] = config['INTEGRATION'].get('Host')
+        integration_config['SessionCheckTime'] = config['INTEGRATION'].get('SessionCheckTime')
+        return integration_config
     except:
-        print("    GET CONTROLDB PART OF CONFIG ERROR")
+        print("    GET INTEGRATION PART OF CONFIG ERROR")
         return None       
         
 def get_config_general(config) :
@@ -77,33 +75,61 @@ def get_config_general(config) :
         print("    GET GENERAL PART OF CONFIG ERROR")
         return None
 
-def get_db_connection(config, interval) :
+def get_status(config, interval) :
     #
-    # Иниицализация соединения с управляющей БД
+    # Получение статуса
     #
-    cnx = None
-    print(" -> CONTROLLER DATABASE CONNECTION INITIALIZING")
+    print(" -> STATUS CONNECTION INITIALIZING")
     while True:
         try:
+            active_session_id = 0
             print("    TRYING TO CONNECT")
-            cnx = mysql.connector.connect(
-                user = config['User'],
-                password = config['Password'],
-                host = config['Host'],
-                database = config['Database']
+            url = config['Host'] + '/api/audio/status/' + config['SourceName']
+            response = requests.get(
+                url,
+                headers = {'Auth-Token': config['Token']},
+                timeout = (5, 10)
             )
-        except mysql.connector.Error as err:
-            if err.errno == errorcode.ER_ACCESS_DENIED_ERROR:
-                print("    ERROR. ACCESS DENIED")
-            elif err.errno == errorcode.ER_BAD_DB_ERROR:
-                print("    ERROR. DATABASE NOT FOUND")
-            else:
-                print(err)
-            time.sleep(session_check_time)
+            response.raise_for_status()
+        except HTTPError as err:
+            print(f'    CONNECTION ERROR: {err}')
+            time.sleep(interval)
+            continue
+        except requests.ConnectionError as err:
+            print(f'    CONNECTION ERROR: {err}')
+            time.sleep(interval)
+            continue
+        except requests.Timeout as err:
+            print("    ERROR. CONNECTION TIMEOUT: {err}")
+            time.sleep(interval)
+            continue
+        except Exception as err:
+            print(f'    INTERNAL ERROR: {err}')
+            time.sleep(interval)
             continue
         else:
+            json_response = response.json()
+            active_session_id = json_response["session"]
             break
-    return cnx
+    return active_session_id
+    
+def send_data(config, data_to_send) :
+    try:
+        url = config['Host'] + '/api/audio/send/' + config['SourceName']
+        response = requests.post(
+            url,
+            data={"rms": data_to_send},
+            headers = {'Auth-Token': config['Token']},
+            timeout = (5, 10)
+        )
+        response.raise_for_status()
+    except HTTPError as err:
+        print(f'    CONNECTION ERROR: {err}')
+    except requests.Timeout as err:
+        print("    ERROR. CONNECTION TIMEOUT: {err}")
+    except Exception as err:
+        print(f'    INTERNAL ERROR: {err}')
+    return None
     
 def find_microphone(pyaudio, prefered_device_index = None, attempt = 1) :
     #
@@ -180,11 +206,6 @@ def get_rms( block, audio_config ):
         sum_squares += n*n
 
     return math.sqrt( sum_squares / count )
-
-def update_session_id(cursor, active_session_id) :
-    cursor.execute(f"SELECT session_id FROM active_session WHERE active_session_id = {active_session_id}")
-    record = cursor.fetchone()
-    return int( record[0])
     
 ########################################
 
@@ -192,23 +213,17 @@ def update_session_id(cursor, active_session_id) :
 config = load_configfile()
 audio_config = get_config_audio(config)
 general_config = get_config_general(config)
-controldb_config = get_config_controldb(config)
-if (audio_config is None or general_config is None or controldb_config is None) :
+integration_config = get_config_integration(config)
+if (audio_config is None or general_config is None or integration_config is None) :
     time.sleep(5)
     exit()
 
-# Подключение к управляющей БД
-cnx = get_db_connection(controldb_config, 5)
-if (cnx is None) :
-    print("    CANNOT CONNECT TO CONTROLLER DATABASE")
+# Получение статуса
+active_session_id = get_status(integration_config, 5)
+if (active_session_id is None) :
+    print("    CONNECTION ERROR")
     time.sleep(5)
     exit()
-cursor = cnx.cursor()
-
-# Получение статуса от управляющей БД
-cursor.execute(f"SELECT active_session_id FROM active_session WHERE sourcename = {audio_config['SourceName']}")
-record = cursor.fetchone()
-active_session_id = int( record[0])
 
 # Отображение таблицы найденных устройств
 p = pyaudio.PyAudio()
@@ -239,14 +254,10 @@ print("    MICROPHONE CONNECTED")
 print(" -> STARTING OBSERVATION PROCESS")
 # Время в секундах между попытками подключения к БД 
 # recommended period is 30..120 seconds
-session_check_time = int(config['SESSION'].get('SessionCheckTime'))
+session_check_time = int(config['INTEGRATION'].get('SessionCheckTime'))
 cur_time = prev_time = prev_file_save_time = 0
 session_id = 0
-        
-# format for INSERT record
-insert_template = ("INSERT INTO records "
-              "(session_id, source, rms) "
-              "VALUES (%s, %s, %s)")
+
 
 waveFile = None
 while True:
@@ -259,8 +270,7 @@ while True:
         
         # Получение текущего статуса от управляюбщей БД
         prev_session_id = session_id
-        session_id = update_session_id(cursor, active_session_id)
-        cnx.commit()
+        session_id = get_status(integration_config, 5)
         
         if (int(prev_session_id) != int(session_id)) :
             # Идентификатор сессии изменился, закрытие текущего файла
@@ -299,8 +309,7 @@ while True:
             
     
     # Получение данных
-    block_rms = get_rms( data, audio_config)
-    rms_data = (session_id, audio_config['SourceName'], block_rms)
+    block_rms = get_rms(data, audio_config)
 
     # Сохранение данных в файл
     try:
@@ -319,11 +328,12 @@ while True:
     try:
         if (general_config['Verbose']) :
             print(f"    SEND DATA. Time={cur_time:.2f}, session_id={session_id}, data={block_rms}")
-        cursor.execute(insert_template, rms_data)
-        cnx.commit()
+        send_data(integration_config, block_rms)
+        if (general_config['Verbose']) :
+            print(f"        SEND DATA SUCCESS.")
     except :
         # Ошибка отправки данных
-        print(cursor._last_executed)
+        print("    ERROR SENDING DATA")
         time.sleep(5)
         raise
 
@@ -333,10 +343,6 @@ print(" -> OBSERVATION PROCESS FINISHED")
 stream.stop_stream()
 stream.close()
 p.terminate()
-
-# close database connection
-cursor.close()
-cnx.close()
 
 if (isinstance(waveFile, Wave_write)) :
     waveFile.close()
